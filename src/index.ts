@@ -26,6 +26,16 @@ interface FaceMapping {
     faceIndexToBlockbenchFace: Map<number, MeshFace>;
 }
 
+// Cube face names mapped to their normal vectors
+const CUBE_FACE_NORMALS: Record<string, THREE.Vector3> = {
+    north: new THREE.Vector3(0, 0, -1),
+    south: new THREE.Vector3(0, 0, 1),
+    east: new THREE.Vector3(1, 0, 0),
+    west: new THREE.Vector3(-1, 0, 0),
+    up: new THREE.Vector3(0, 1, 0),
+    down: new THREE.Vector3(0, -1, 0),
+};
+
 let button: Action;
 
 (Plugin as any).register('baked_ambient_occlusion', {
@@ -33,7 +43,7 @@ let button: Action;
     "author": "Kai Salmon",
     "description": "Baked Ambient Occlusion, creating instant shading",
     "icon": "icon.png",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "min_version": "4.8.0",
     "variant": "both",
     "repository": "https://github.com/kaisalmon/MrSalmonsBlockbenchBakedAmbientOcclusion",
@@ -45,7 +55,7 @@ let button: Action;
     onload(): void {
         button = new Action('bake_ambient_occlusion', {
             name: 'Bake Ambient Occlusion',
-            description: 'Perform ambient occlusion baking on selected meshes',
+            description: 'Perform ambient occlusion baking on selected cubes/meshes',
             icon: 'cake',
             click: function (): void {
                 showAmbientOcclusionDialog();
@@ -70,27 +80,78 @@ function colorToHex(color: Color): string {
 
 /**
  * Collects all Three.js meshes from visible Cubes and Meshes in the scene to act as occluders.
+ * This allows raycasts to detect nearby geometry for accurate ambient occlusion.
  */
 function getSceneOccluders(): THREE.Object3D[] {
     const occluders: THREE.Object3D[] = [];
 
     // Add all visible cubes
-    Cube.all.forEach(cube => {
-        if (cube.visibility && cube.mesh) {
+    (Cube.all as Cube[]).forEach(cube => {
+        if (cube.visibility !== false && cube.mesh) {
             cube.mesh.updateMatrixWorld(true);
             occluders.push(cube.mesh);
         }
     });
 
     // Add all visible meshes
-    Mesh.all.forEach(mesh => {
-        if (mesh.visibility && mesh.mesh) {
+    (Mesh.all as Mesh[]).forEach(mesh => {
+        if (mesh.visibility !== false && mesh.mesh) {
             mesh.mesh.updateMatrixWorld(true);
             occluders.push(mesh.mesh);
         }
     });
 
     return occluders;
+}
+
+/**
+ * Gets world space position and world normal for a texel on a specific cube face.
+ * Maps UV coordinates within a face's texture rectangle back to 3D world space.
+ */
+function getCubeTexelWorldData(
+    cube: Cube,
+    faceName: string,
+    uFrac: number, // normalized [0..1] along UV width
+    vFrac: number  // normalized [0..1] along UV height
+): { position: THREE.Vector3; normal: THREE.Vector3 } | null {
+    if (!cube.mesh) return null;
+
+    // Get cube dimensions and bounds
+    const from = new THREE.Vector3(...(cube.from as [number, number, number]));
+    const to = new THREE.Vector3(...(cube.to as [number, number, number]));
+    const size = new THREE.Vector3().subVectors(to, from);
+
+    // Calculate local position on face based on face orientation
+    const localPos = new THREE.Vector3();
+    const localNormal = (CUBE_FACE_NORMALS[faceName] || new THREE.Vector3(0, 0, 1)).clone();
+
+    switch (faceName) {
+        case 'north':
+            localPos.set(from.x + size.x * uFrac, from.y + size.y * (1 - vFrac), from.z);
+            break;
+        case 'south':
+            localPos.set(to.x - size.x * uFrac, from.y + size.y * (1 - vFrac), to.z);
+            break;
+        case 'east':
+            localPos.set(to.x, from.y + size.y * (1 - vFrac), from.z + size.z * uFrac);
+            break;
+        case 'west':
+            localPos.set(from.x, from.y + size.y * (1 - vFrac), to.z - size.z * uFrac);
+            break;
+        case 'up':
+            localPos.set(from.x + size.x * uFrac, to.y, from.z + size.z * vFrac);
+            break;
+        case 'down':
+            localPos.set(from.x + size.x * uFrac, from.y, to.z - size.z * vFrac);
+            break;
+    }
+
+    // Transform local position & normal to World Space using the cube mesh's matrix
+    const worldPos = localPos.clone().applyMatrix4(cube.mesh.matrixWorld);
+    const normalMatrix = new THREE.Matrix3().getNormalMatrix(cube.mesh.matrixWorld);
+    const worldNormal = localNormal.clone().applyMatrix3(normalMatrix).normalize();
+
+    return { position: worldPos, normal: worldNormal };
 }
 
 /**
@@ -104,19 +165,15 @@ function hexToColor(hex: string, alpha: number): Color {
 }
 
 function showAmbientOcclusionDialog(): void {
-    if (Mesh.selected.length === 0) {
-        Blockbench.showToastNotification({
-            text: 'No meshes selected',
-        });
-        return;
-    }
-    if (Mesh.selected.length > 1) {
-        Blockbench.showToastNotification({
-            text: 'Multiple meshes selected',
-        });
-        return;
-    }
+    const hasCubes = (Cube.selected as Cube[]).length > 0;
+    const hasMeshes = (Mesh.selected as Mesh[]).length > 0;
 
+    if (!hasCubes && !hasMeshes) {
+        Blockbench.showToastNotification({
+            text: 'No cubes or meshes selected',
+        });
+        return;
+    }
 
     // Load saved settings or use defaults
     const savedSettings = getPluginSettings();
@@ -339,18 +396,34 @@ async function bakeAmbientOcclusion(opts: BakeAmbientOcclusionOptions, jobContro
 
     performance.mark("startAO");
 
-    for (const mesh of Mesh.selected) {
+    // Gather all occluders once at the start (cubes, meshes, ground plane)
+    const sceneOccluders = getSceneOccluders();
+    const [lowestY] = getHighestAndLowestYFromScene();
+    const groundPlane: THREE.Mesh | null = opts.simulateGroundPlane ? createGroundPlane(lowestY) : null;
+    if (groundPlane) {
+        sceneOccluders.push(groundPlane);
+    }
+
+    // Process selected cubes
+    const cubes = (Cube.selected as Cube[]).length > 0 ? (Cube.selected as Cube[]) : [];
+    for (const cube of cubes) {
+        const result = await processCubeFaces(cube, opts, jobController, sceneOccluders);
+        anyWithTextures = anyWithTextures || result.anyWithTextures;
+        pixelCount += result.totalPixelsProcessed;
+        faceCount += result.totalFacesProcessed;
+    }
+
+    // Process selected meshes
+    const meshes = (Mesh.selected as Mesh[]).length > 0 ? (Mesh.selected as Mesh[]) : [];
+    for (const mesh of meshes) {
         let hasSelectedFaces: boolean = false;
-        let facesInMesh = 0;
         mesh.forAllFaces((face: MeshFace) => {
             if (face.isSelected()) {
                 hasSelectedFaces = true;
             }
-            facesInMesh++;
         });
 
-        // Process each face
-        const result = await processMeshFaces(mesh, hasSelectedFaces, opts, jobController);
+        const result = await processMeshFaces(mesh, hasSelectedFaces, opts, jobController, sceneOccluders);
         anyMissing = anyMissing || result.anyMissing;
         anyWithTextures = anyWithTextures || result.anyWithTextures;
         pixelCount += result.totalPixelsProcessed;
@@ -363,16 +436,142 @@ async function bakeAmbientOcclusion(opts: BakeAmbientOcclusionOptions, jobContro
 
     if (!anyWithTextures) {
         Blockbench.showToastNotification({
-            text: 'No textures found on selected meshes',
+            text: 'No textures found on selected elements',
         });
     } else if (anyMissing) {
         Blockbench.showToastNotification({
             text: 'Some faces are missing textures',
         });
     }
-
 }
 
+/**
+ * Get the highest and lowest Y coordinates of all cubes and meshes in the scene
+ */
+function getHighestAndLowestYFromScene(): [number, number] {
+    let highestY: number = -Infinity;
+    let lowestY: number = Infinity;
+
+    // Check all cubes
+    (Cube.all as Cube[]).forEach(cube => {
+        const minY = Math.min(...(cube.from as [number, number, number]));
+        const maxY = Math.max(...(cube.to as [number, number, number]));
+        lowestY = Math.min(lowestY, minY);
+        highestY = Math.max(highestY, maxY);
+    });
+
+    // Check all meshes
+    (Mesh.all as Mesh[]).forEach(mesh => {
+        if (!mesh.mesh || !(mesh.mesh instanceof THREE.Mesh)) return;
+        const geometry = mesh.mesh.geometry;
+        if (!geometry || !geometry.attributes || !geometry.attributes.position) return;
+        
+        const positionAttribute: THREE.BufferAttribute = geometry.attributes.position as THREE.BufferAttribute;
+        for (let i = 0; i < positionAttribute.count; i++) {
+            const y = positionAttribute.getY(i);
+            lowestY = Math.min(lowestY, y);
+            highestY = Math.max(highestY, y);
+        }
+    });
+
+    return [lowestY === Infinity ? 0 : lowestY, highestY === -Infinity ? 0 : highestY];
+}
+
+interface ProcessCubeFacesResult {
+    anyWithTextures: boolean;
+    totalPixelsProcessed: number;
+    totalFacesProcessed: number;
+}
+
+/**
+ * Process ambient occlusion baking for all faces of a single cube
+ */
+async function processCubeFaces(
+    cube: Cube,
+    opts: BakeAmbientOcclusionOptions,
+    jobController: JobController,
+    sceneOccluders: THREE.Object3D[]
+): Promise<ProcessCubeFacesResult> {
+    let anyWithTextures: boolean = false;
+    let totalPixelsProcessed: number = 0;
+    let totalFacesProcessed: number = 0;
+
+    const faceNames = ['north', 'south', 'east', 'west', 'up', 'down'];
+    const raycaster = new THREE.Raycaster();
+
+    for (const faceName of faceNames) {
+        const face = (cube.faces as any)[faceName];
+        if (!face || face.texture === false) continue;
+
+        const texture = face.getTexture();
+        if (!texture || !texture.img) continue;
+
+        anyWithTextures = true;
+
+        const ctx = (texture as any).ctx;
+        if (!ctx) continue;
+
+        // Get face UV dimensions
+        const [u1, v1, u2, v2] = face.uv;
+        const minU = Math.min(u1, u2);
+        const maxU = Math.max(u1, u2);
+        const minV = Math.min(v1, v2);
+        const maxV = Math.max(v1, v2);
+
+        const texWidth = texture.width;
+        const texHeight = texture.height;
+
+        const startX = Math.floor((minU / 16) * texWidth);
+        const endX = Math.ceil((maxU / 16) * texWidth);
+        const startY = Math.floor((minV / 16) * texHeight);
+        const endY = Math.ceil((maxV / 16) * texHeight);
+
+        // Process each pixel in the face's texture region
+        for (let y = startY; y < endY; y++) {
+            for (let x = startX; x < endX; x++) {
+                const uFrac = (x - startX) / Math.max(1, endX - startX);
+                const vFrac = (y - startY) / Math.max(1, endY - startY);
+
+                // Map texel to world space
+                const worldData = getCubeTexelWorldData(cube, faceName, uFrac, vFrac);
+                if (!worldData) continue;
+
+                // Calculate AO from nearby scene objects
+                const aoValue = calculateSceneAO(
+                    worldData.position,
+                    worldData.normal,
+                    sceneOccluders,
+                    opts.samples,
+                    opts.aoShadowSize,
+                    opts.aoHighlightSize,
+                    opts.sampleMethod,
+                    raycaster
+                );
+
+                // Apply AO color to texture
+                const t = aoValue.occlusionFactor;
+                const color = aoValue.isHighlight ? opts.highlightColor : opts.shadowColor;
+                const gamma = aoValue.isHighlight ? opts.highlightGamma : opts.shadowGamma;
+                const gammaT = Math.pow(t, gamma);
+
+                ctx.fillStyle = `rgba(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)}, ${color.a * gammaT})`;
+                ctx.fillRect(x, y, 1, 1);
+
+                totalPixelsProcessed++;
+            }
+
+            if (jobController.cancelled) {
+                throw new Error('Job cancelled');
+            }
+        }
+
+        totalFacesProcessed++;
+        opts?.onProgress?.((totalFacesProcessed / (faceNames.length)) * 0.5);
+    }
+
+    (texture as any).update?.();
+    return { anyWithTextures, totalPixelsProcessed, totalFacesProcessed };
+}
 
 function buildFaceMapping(mesh: Mesh): FaceMapping {
     // NOTE: This code duplicates some esoteric logic in from within Blockbench
@@ -405,8 +604,13 @@ interface ProcessMeshFacesResult {
     totalFacesProcessed: number;
 }
 
-
-async function processMeshFaces(mesh: Mesh, hasSelectedFaces: boolean, opts: BakeAmbientOcclusionOptions, jobController: JobController): Promise<ProcessMeshFacesResult> {
+async function processMeshFaces(
+    mesh: Mesh,
+    hasSelectedFaces: boolean,
+    opts: BakeAmbientOcclusionOptions,
+    jobController: JobController,
+    sceneOccluders: THREE.Object3D[]
+): Promise<ProcessMeshFacesResult> {
     let anyMissing: boolean = false;
     let anyWithTextures: boolean = false;
     let totalPixelsProcessed: number = 0;
@@ -434,10 +638,6 @@ async function processMeshFaces(mesh: Mesh, hasSelectedFaces: boolean, opts: Bak
         facesByTexture.get(tex)!.push(face);
     }
 
-    const [lowestY]: [number, number] = getHighestAndLowestY(mesh);
-
-    const groundPlane: THREE.Mesh | null = opts.simulateGroundPlane ? createGroundPlane(lowestY) : null;
-
     const geometry: THREE.BufferGeometry = (mesh.mesh as THREE.Mesh).geometry;
     const geometryBackup = geometry.clone(); // Backup as BVH mutates the geometry in a way that causes bugs in Blockbench
     const bvh: MeshBVH = new MeshBVH(geometry, {
@@ -451,7 +651,7 @@ async function processMeshFaces(mesh: Mesh, hasSelectedFaces: boolean, opts: Bak
     try {
         for (const [texture, textureFaces] of facesByTexture) {
             const { pixelsProcessed, facesProcessed } = await processTextureWithFaces(
-                texture, textureFaces, mesh, groundPlane, bvh, faceMapping, opts, jobController
+                texture, textureFaces, mesh, bvh, faceMapping, opts, jobController, sceneOccluders
             );
             totalPixelsProcessed += pixelsProcessed;
             totalFacesProcessed += facesProcessed;
@@ -484,11 +684,11 @@ async function processTextureWithFaces(
     texture: Texture,
     faces: MeshFace[],
     mesh: Mesh,
-    groundPlane: THREE.Mesh | null,
     bvh: MeshBVH,
     faceMapping: FaceMapping,
     opts: BakeAmbientOcclusionOptions,
-    jobController: JobController
+    jobController: JobController,
+    sceneOccluders: THREE.Object3D[]
 ): Promise<{
     pixelsProcessed: number;
     facesProcessed: number;
@@ -497,6 +697,8 @@ async function processTextureWithFaces(
     const bestResults: Map<string, PixelResult> = new Map();
 
     let facesProcessed: number = 0;
+    const raycaster = new THREE.Raycaster();
+
     for (const face of faces) {
         const occupationMatrix: Record<string, Record<string, boolean>> = face.getOccupationMatrix();
         const texture = face.getTexture();
@@ -529,7 +731,18 @@ async function processTextureWithFaces(
 
             // Get x,y,z in 3d space of the face at this u,v
             let { x, y, z } = face.UVToLocal([(u + 0.5) / pixelDensityU, (v + 0.5) / pixelDensityV]);
-            const result = calculateAmbientOcclusion([x, y, z], [u, v], face, mesh, groundPlane, bvh, faceMapping, opts, generateFibonacciSpherePoints(opts.samples));
+            const result = calculateAmbientOcclusion(
+                [x, y, z],
+                [u, v],
+                face,
+                mesh,
+                bvh,
+                faceMapping,
+                opts,
+                generateFibonacciSpherePoints(opts.samples),
+                sceneOccluders,
+                raycaster
+            );
 
             if (result) {
                 const [color, backfaceRatio] = result;
@@ -588,17 +801,65 @@ const vectorPool: VectorPool = {
     normal: new THREE.Vector3()
 };
 
+/**
+ * Calculate AO by raycasting against all nearby scene objects
+ */
+function calculateSceneAO(
+    position: THREE.Vector3,
+    normal: THREE.Vector3,
+    occluders: THREE.Object3D[],
+    rayCount: number,
+    aoShadowSize: number,
+    aoHighlightSize: number,
+    sampleMethod: 'random' | 'uniform',
+    raycaster: THREE.Raycaster
+): { occlusionFactor: number; isHighlight: boolean } {
+    let occlusion = 0;
+    const offsetOrigin = position.clone().addScaledVector(normal, 0.01);
+    const spherePoints = generateFibonacciSpherePoints(rayCount);
+
+    for (let i = 0; i < rayCount; i++) {
+        let direction: THREE.Vector3;
+
+        if (sampleMethod === 'random') {
+            direction = new THREE.Vector3(
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2
+            ).normalize();
+        } else {
+            direction = spherePoints[i];
+        }
+
+        const rayDot = direction.dot(normal);
+        const radius = rayDot >= 0 ? aoShadowSize : aoHighlightSize;
+
+        raycaster.set(offsetOrigin, direction);
+        raycaster.far = radius;
+
+        const hits = raycaster.intersectObjects(occluders, true);
+        if (hits.length > 0) {
+            occlusion += 1;
+        }
+    }
+
+    const occlusionFactor = 1 - occlusion / rayCount;
+    const isHighlight = occlusionFactor >= 0.5;
+
+    return { occlusionFactor: Math.abs(occlusionFactor - 0.5) * 2, isHighlight };
+}
 
 function calculateAmbientOcclusion(
     position: [number, number, number],
     uv: [number, number],
     face: MeshFace,
     mesh: Mesh,
-    groundPlane: THREE.Mesh | null,
     bvh: MeshBVH,
     faceMapping: FaceMapping,
     opts: BakeAmbientOcclusionOptions,
     spherePoints: Record<number, THREE.Vector3>,
+    sceneOccluders: THREE.Object3D[],
+    raycaster: THREE.Raycaster
 ): [[number, number, number, number], number] | null {
     const [x, y, z]: [number, number, number] = position;
     const [normalX, normalY, normalZ]: [number, number, number] = face.getNormal(true);
@@ -628,9 +889,14 @@ function calculateAmbientOcclusion(
         }
         const rayDot = direction.dot(vectorPool.normal);
         const radius = rayDot >= 0 ? opts.aoShadowSize : opts.aoHighlightSize;
-        const raycaster: THREE.Raycaster = new THREE.Raycaster(vectorPool.origin, direction, 0.001, radius);
+        raycaster.set(vectorPool.origin, direction);
+        raycaster.far = radius;
+        raycaster.near = 0.001;
 
+        // First check BVH for mesh geometry
         const hit = bvh.raycastFirst(raycaster.ray, THREE.DoubleSide, 0.001, radius);
+        let hasHit = false;
+
         if (hit) {
             const faceNormal = hit.face!.normal!;
             const dot = vectorPool.direction.dot(faceNormal);
@@ -646,7 +912,7 @@ function calculateAmbientOcclusion(
                     const [hitU, hitV] = blockbenchFace.localToUV(hit.point!);
                     const texture: Texture | undefined = blockbenchFace.getTexture();
                     if (texture) {
-                        const pixelColor: ImageData = texture.ctx.getImageData(hitU, hitV, 1, 1);
+                        const pixelColor: ImageData = (texture as any).ctx.getImageData(hitU, hitV, 1, 1);
                         occlusion += pixelColor.data[3] / 255;
                     } else {
                         occlusion += 1;
@@ -656,10 +922,13 @@ function calculateAmbientOcclusion(
                     occlusion += 1;
                 }
             }
-        } else {
-            // Check if the ray intersects the ground plane
-            const groundPlaneHit = groundPlane && raycaster.intersectObject(groundPlane).length > 0;
-            if (groundPlaneHit) {
+            hasHit = true;
+        }
+
+        // Also check against scene occluders (nearby cubes/meshes)
+        if (!hasHit) {
+            const sceneHits = raycaster.intersectObjects(sceneOccluders, true);
+            if (sceneHits.length > 0) {
                 occlusion += 1;
             }
         }
