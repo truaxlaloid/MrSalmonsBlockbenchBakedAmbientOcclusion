@@ -69,6 +69,31 @@ function colorToHex(color: Color): string {
 }
 
 /**
+ * Collects all Three.js meshes from visible Cubes and Meshes in the scene to act as occluders.
+ */
+function getSceneOccluders(): THREE.Object3D[] {
+    const occluders: THREE.Object3D[] = [];
+
+    // Add all visible cubes
+    Cube.all.forEach(cube => {
+        if (cube.visibility && cube.mesh) {
+            cube.mesh.updateMatrixWorld(true);
+            occluders.push(cube.mesh);
+        }
+    });
+
+    // Add all visible meshes
+    Mesh.all.forEach(mesh => {
+        if (mesh.visibility && mesh.mesh) {
+            mesh.mesh.updateMatrixWorld(true);
+            occluders.push(mesh.mesh);
+        }
+    });
+
+    return occluders;
+}
+
+/**
  * Convert hex string to RGB color object
  */
 function hexToColor(hex: string, alpha: number): Color {
