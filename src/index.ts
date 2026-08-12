@@ -569,7 +569,7 @@ async function processCubeFaces(
         opts?.onProgress?.((totalFacesProcessed / (faceNames.length)) * 0.5);
     }
 
-    (texture as any).update?.();
+    (Texture as any).update?.();
     return { anyWithTextures, totalPixelsProcessed, totalFacesProcessed };
 }
 
